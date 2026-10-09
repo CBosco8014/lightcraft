@@ -25,6 +25,13 @@ pub const MAX_CONNECTIONS: usize = 16;
 
 pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
     let (tx, rx) = channel::<ControlRequest>();
+    let token = match std::env::var("LIGHTCRAFT_CONTROL_TOKEN") {
+        Ok(t) if t.len() >= 32 && t.len() <= 256 && t.bytes().all(|b| b.is_ascii_graphic()) => Arc::new(t),
+        _ => {
+            log::error!("control server requires LIGHTCRAFT_CONTROL_TOKEN (32–256 printable ASCII characters); not listening");
+            return rx;
+        }
+    };
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(l) => l,
         Err(e) => {
@@ -33,11 +40,11 @@ pub fn start(port: u16, ctx: egui::Context) -> Receiver<ControlRequest> {
         }
     };
     log::info!("control server listening on 127.0.0.1:{port}");
-    std::thread::spawn(move || accept_loop(listener, tx, ctx));
+    std::thread::spawn(move || accept_loop(listener, tx, ctx, token));
     rx
 }
 
-fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context) {
+fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Context, token: Arc<String>) {
     let open = Arc::new(AtomicUsize::new(0));
     for mut stream in listener.incoming().flatten() {
         if open.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
@@ -48,16 +55,17 @@ fn accept_loop(listener: TcpListener, tx: Sender<ControlRequest>, ctx: egui::Con
         let tx = tx.clone();
         let ctx = ctx.clone();
         let open = Arc::clone(&open);
+        let token = Arc::clone(&token);
         std::thread::spawn(move || {
-            serve(stream, &tx, &ctx);
+            serve(stream, &tx, &ctx, &token);
             open.fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
 
-fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context) {
+fn serve(stream: TcpStream, tx: &Sender<ControlRequest>, ctx: &egui::Context, token: &str) {
     let Ok(read) = stream.try_clone() else { return };
-    serve_lines(read, stream, |method, params| {
+    serve_lines(read, stream, token, |method, params| {
         let (req, rrx) = ControlRequest::new(method, params);
         tx.send(req).ok()?;
         ctx.request_repaint();
@@ -77,7 +85,14 @@ enum Line {
     Reject(String),
 }
 
-fn parse_line(bytes: &[u8]) -> Line {
+fn same_token(given: &str, expected: &str) -> bool {
+    if given.len() != expected.len() {
+        return false;
+    }
+    given.bytes().zip(expected.bytes()).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
+}
+
+fn parse_line(bytes: &[u8], token: &str) -> Line {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Line::Reject("not a control request (invalid UTF-8); closing the connection".into());
     };
@@ -92,6 +107,9 @@ fn parse_line(bytes: &[u8]) -> Line {
     let Some(obj) = msg.as_object() else {
         return Line::Reject("not a control request (expected a JSON object); closing the connection".into());
     };
+    if !token.is_empty() && !obj.get("auth").and_then(Value::as_str).is_some_and(|given| same_token(given, token)) {
+        return Line::Reject("control authentication failed; closing the connection".into());
+    }
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
         return Line::Reject("not a control request (missing string `method`); closing the connection".into());
     };
@@ -129,14 +147,14 @@ fn read_bounded_line(reader: &mut impl BufRead, buf: &mut Vec<u8>, max: usize) -
 /// Serve requests from `read`, answering on `out`, until the peer closes, sends something that is
 /// not a request, or `handle` returns `None` (app gone). `handle` gets `(method, params)` and
 /// returns the reply object (the request's `id` is added here).
-fn serve_lines<R: Read, W: Write>(read: R, mut out: W, mut handle: impl FnMut(String, Value) -> Option<Value>) {
+fn serve_lines<R: Read, W: Write>(read: R, mut out: W, token: &str, mut handle: impl FnMut(String, Value) -> Option<Value>) {
     let mut reader = BufReader::new(read);
     let mut buf = Vec::new();
     loop {
         let reject = match read_bounded_line(&mut reader, &mut buf, MAX_LINE) {
             Ok(false) => return,
             Err(e) => e,
-            Ok(true) => match parse_line(&buf) {
+            Ok(true) => match parse_line(&buf, token) {
                 Line::Blank => continue,
                 Line::Reject(e) => e,
                 Line::Request { id, method, params } => {
@@ -163,7 +181,7 @@ mod tests {
     fn run(input: &[u8]) -> (Vec<Value>, Vec<String>) {
         let mut out = Vec::new();
         let mut calls = Vec::new();
-        serve_lines(input, &mut out, |m, _p| {
+        serve_lines(input, &mut out, "", |m, _p| {
             calls.push(m);
             Some(json!({"ok": true, "result": null}))
         });
@@ -179,6 +197,32 @@ mod tests {
         assert_eq!(r[0]["id"], 1);
         assert_eq!(r[1]["id"], 2);
         assert_eq!(r[2]["id"], Value::Null);
+    }
+
+    #[test]
+    fn missing_or_wrong_token_never_dispatches_a_command() {
+        for input in [&b"{\"method\":\"engine.execute\"}\n"[..], b"{\"auth\":\"wrong\",\"method\":\"engine.execute\"}\n"] {
+            let mut out = Vec::new();
+            let mut ran = false;
+            serve_lines(input, &mut out, "a-secret-token-with-at-least-32-chars", |_, _| {
+                ran = true;
+                Some(json!({"ok": true}))
+            });
+            assert!(!ran);
+            assert!(String::from_utf8_lossy(&out).contains("authentication failed"));
+        }
+        let mut out = Vec::new();
+        let mut ran = false;
+        serve_lines(
+            b"{\"auth\":\"a-secret-token-with-at-least-32-chars\",\"method\":\"ui.inspect\"}\n".as_slice(),
+            &mut out,
+            "a-secret-token-with-at-least-32-chars",
+            |_, _| {
+                ran = true;
+                Some(json!({"ok": true}))
+            },
+        );
+        assert!(ran);
     }
 
     #[test]
@@ -223,7 +267,7 @@ mod tests {
         let endless = std::io::repeat(b'x');
         let mut out = Vec::new();
         let mut ran = false;
-        serve_lines(endless, &mut out, |_, _| {
+        serve_lines(endless, &mut out, "", |_, _| {
             ran = true;
             None
         });
@@ -251,7 +295,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
             let read = s.try_clone().unwrap();
-            serve_lines(read, s, |_, _| Some(json!({"ok": true})));
+            serve_lines(read, s, "", |_, _| Some(json!({"ok": true})));
         });
         let mut c = TcpStream::connect(addr).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();

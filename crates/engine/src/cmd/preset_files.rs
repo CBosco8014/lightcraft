@@ -1,9 +1,10 @@
 //! Preset files: import `.lcpreset`, XMP, `.lrtemplate`, DNG-preset, Luminar looks and zip bundles; export `.lcpreset`.
 
 use serde_json::{Value, json};
+use std::io::Read;
 
 use super::{CommandSpec, always, bad, cmd, str_param};
-use crate::preset_import::{group_from_dir, read_presets};
+use crate::preset_import::{MAX_PRESET_ZIP_BYTES, group_from_dir, read_presets};
 use crate::presets::{LCPRESET_EXT, expand_preset_paths, to_lcpreset};
 use crate::{Result, Session};
 
@@ -26,7 +27,21 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
             let base = std::path::Path::new(top).parent().unwrap_or(std::path::Path::new(""));
             let rel = std::path::Path::new(&f).parent().and_then(|d| d.strip_prefix(base).ok()).map(|d| d.to_string_lossy().to_string());
             let dir_group = rel.filter(|_| from_dir).and_then(|d| group_from_dir(&d));
-            let parsed = std::fs::read(&f).map_err(|e| e.to_string()).and_then(|b| read_presets(&f, &b, dir_group));
+            let parsed = (|| {
+                let is_zip = std::path::Path::new(&f).extension().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("zip"));
+                let b = if is_zip {
+                    let file = std::fs::File::open(&f).map_err(|e| e.to_string())?;
+                    let mut b = Vec::new();
+                    file.take(MAX_PRESET_ZIP_BYTES as u64 + 1).read_to_end(&mut b).map_err(|e| e.to_string())?;
+                    if b.len() > MAX_PRESET_ZIP_BYTES {
+                        return Err("preset ZIP exceeds 64 MiB".into());
+                    }
+                    b
+                } else {
+                    std::fs::read(&f).map_err(|e| e.to_string())?
+                };
+                read_presets(&f, &b, dir_group)
+            })();
             match parsed {
                 Ok(list) => {
                     for mut it in list {

@@ -105,9 +105,24 @@ if has appimage; then
   TOOL="${APPIMAGETOOL:-$(command -v appimagetool || true)}"
   if [ -z "$TOOL" ]; then
     TOOL="$CARGO_TARGET_DIR/appimagetool-$ARCH.AppImage"
-    if [ ! -x "$TOOL" ]; then
-      curl -fsSL -o "$TOOL" "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"
-      chmod +x "$TOOL"
+    # This upstream release is mutable. Verify both cached and fresh copies before execution.
+    # Digests are from the GitHub release asset metadata; update them deliberately when needed.
+    case "$ARCH" in
+      x86_64) TOOL_SHA256=95cbe7cce9717fce90c484e34052ee7c7f1d7635b33c12525b4776826a7d29b6 ;;
+      aarch64) TOOL_SHA256=a595ea34cd6136c7f595e9dcbb16f3e9725d7610efb9e43b38c3c6e86cafc270 ;;
+    esac
+    if [ ! -f "$TOOL" ] || [ "$(sha256 "$TOOL")" != "$TOOL_SHA256" ]; then
+      DOWNLOAD="$TOOL.download.$$"
+      trap 'rm -f "$DOWNLOAD"' EXIT
+      curl --proto '=https' --tlsv1.2 -fsSL -o "$DOWNLOAD" \
+        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$ARCH.AppImage"
+      if [ "$(sha256 "$DOWNLOAD")" != "$TOOL_SHA256" ]; then
+        echo "appimagetool SHA-256 mismatch; refusing to execute the download" >&2
+        exit 1
+      fi
+      chmod +x "$DOWNLOAD"
+      mv -f "$DOWNLOAD" "$TOOL"
+      trap - EXIT
     fi
   fi
   # Absolute, because appimagetool runs in $DIST below (CARGO_TARGET_DIR or APPIMAGETOOL may be

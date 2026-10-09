@@ -25,27 +25,49 @@ pub struct Imported {
 
 /// Extensions of files read as presets (beyond our own `.lcpreset`).
 pub const PRESET_EXTS: &[&str] = &["xmp", "lrtemplate", "zip", "dng", "lmp", "mplumpack"];
+pub const MAX_PRESET_ZIP_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ZIP_ENTRIES: usize = 4096;
+const MAX_ZIP_ENTRY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ZIP_TOTAL_BYTES: usize = 128 * 1024 * 1024;
 
 // ------------------------------------------------------------------------------------- zip
 
 /// The files of a zip archive: (path inside the archive, bytes). Stored and deflated entries;
 /// directories, macOS resource forks and hidden files are skipped.
 pub fn read_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
+    if bytes.len() > MAX_PRESET_ZIP_BYTES {
+        return Err("preset ZIP exceeds 64 MiB".into());
+    }
     let u16_at = |o: usize| bytes.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize);
     let u32_at = |o: usize| bytes.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
     // end of central directory: the last "PK\x05\x06" within the trailing 64 KiB + 22 bytes
     let tail = bytes.len().saturating_sub(65_557);
     let eocd = (tail..bytes.len().saturating_sub(21)).rev().find(|&i| bytes[i..].starts_with(b"PK\x05\x06")).ok_or("not a zip file")?;
     let count = u16_at(eocd + 10).ok_or("bad zip")?;
+    if count > MAX_ZIP_ENTRIES {
+        return Err("preset ZIP has too many entries".into());
+    }
     let mut at = u32_at(eocd + 16).ok_or("bad zip")?;
     let mut out = Vec::new();
+    let mut expanded = 0usize;
     for _ in 0..count {
+        if at > bytes.len().saturating_sub(46) {
+            return Err("bad zip central directory".into());
+        }
         if !bytes.get(at..).is_some_and(|b| b.starts_with(b"PK\x01\x02")) {
             return Err("bad zip central directory".into());
         }
         let method = u16_at(at + 10).ok_or("bad zip")?;
+        let crc = u32_at(at + 16).ok_or("bad zip")? as u32;
         let csize = u32_at(at + 20).ok_or("bad zip")?;
         let usize_ = u32_at(at + 24).ok_or("bad zip")?;
+        if usize_ > MAX_ZIP_ENTRY_BYTES || usize_ > csize.saturating_mul(1000).saturating_add(1024) {
+            return Err("preset ZIP entry exceeds size or compression-ratio limit".into());
+        }
+        expanded = expanded.checked_add(usize_).ok_or("preset ZIP expanded size overflow")?;
+        if expanded > MAX_ZIP_TOTAL_BYTES {
+            return Err("preset ZIP expands beyond 128 MiB".into());
+        }
         let (nlen, xlen, clen) = (u16_at(at + 28).ok_or("bad zip")?, u16_at(at + 30).ok_or("bad zip")?, u16_at(at + 32).ok_or("bad zip")?);
         let local = u32_at(at + 42).ok_or("bad zip")?;
         let name = String::from_utf8_lossy(bytes.get(at + 46..at + 46 + nlen).ok_or("bad zip")?).replace('\\', "/");
@@ -54,16 +76,20 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, String> {
         if skip {
             continue;
         }
-        if !bytes.get(local..).is_some_and(|b| b.starts_with(b"PK\x03\x04")) {
+        if local > bytes.len().saturating_sub(30) || !bytes.get(local..).is_some_and(|b| b.starts_with(b"PK\x03\x04")) {
             return Err(format!("{name}: bad local header"));
         }
         let data_at = local + 30 + u16_at(local + 26).ok_or("bad zip")? + u16_at(local + 28).ok_or("bad zip")?;
-        let data = bytes.get(data_at..data_at + csize).ok_or_else(|| format!("{name}: truncated"))?;
+        let end = data_at.checked_add(csize).ok_or_else(|| format!("{name}: bad size"))?;
+        let data = bytes.get(data_at..end).ok_or_else(|| format!("{name}: truncated"))?;
         let content = match method {
             0 => data.to_vec(),
-            8 => miniz_oxide::inflate::decompress_to_vec_with_limit(data, usize_.max(1) * 2 + 1024).map_err(|e| format!("{name}: {e:?}"))?,
+            8 => miniz_oxide::inflate::decompress_to_vec_with_limit(data, usize_.max(1)).map_err(|e| format!("{name}: {e:?}"))?,
             m => return Err(format!("{name}: unsupported compression method {m}")),
         };
+        if content.len() != usize_ || crc32fast::hash(&content) != crc {
+            return Err(format!("{name}: size or CRC mismatch"));
+        }
         out.push((name, content));
     }
     Ok(out)
@@ -572,7 +598,8 @@ pub(crate) mod tests {
                 out.extend_from_slice(&20u16.to_le_bytes());
                 out.extend_from_slice(&0u16.to_le_bytes());
                 out.extend_from_slice(&method.to_le_bytes());
-                out.extend_from_slice(&[0; 8]); // time, date, crc (not checked)
+                out.extend_from_slice(&[0; 4]); // time and date
+                out.extend_from_slice(&crc32fast::hash(data).to_le_bytes());
                 out.extend_from_slice(&(body.len() as u32).to_le_bytes());
                 out.extend_from_slice(&(data.len() as u32).to_le_bytes());
                 out.extend_from_slice(&(name.len() as u16).to_le_bytes());
@@ -713,6 +740,20 @@ text]], z = ZSTR "loc" }"#,
         }
         assert!(read_presets("empty.zip", &zip(&[("a.txt", b"x")], true), None).is_err());
         assert!(read_presets("bad.zip", b"not a zip", None).is_err());
+    }
+
+    #[test]
+    fn forged_zip_sizes_and_crc_are_rejected_before_import() {
+        let mut z = zip(&[("preset.xmp", b"safe")], false);
+        let eocd = z.len() - 22;
+        let central = u32::from_le_bytes(z[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        z[central + 24..central + 28].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(read_zip(&z).unwrap_err().contains("size or compression-ratio limit"));
+
+        let mut z = zip(&[("preset.xmp", b"safe")], false);
+        let data_at = 30 + "preset.xmp".len();
+        z[data_at] ^= 1;
+        assert!(read_zip(&z).unwrap_err().contains("CRC mismatch"));
     }
 
     #[test]

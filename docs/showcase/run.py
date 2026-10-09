@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """lcb.py FILE.jsonl — run control requests from a JSON-lines file ({"method":..., "params":...} or {"sleep": s})."""
-import json, socket, sys, time
+import json, os, socket, sys, time
 def call(method, params):
+    token = os.environ.get("LIGHTCRAFT_CONTROL_TOKEN", "")
+    if len(token) < 32:
+        raise SystemExit("set LIGHTCRAFT_CONTROL_TOKEN to the app's 32+ character control token")
     s = socket.create_connection(("127.0.0.1", 7980), timeout=180)
-    s.sendall((json.dumps({"id": 1, "method": method, "params": params}) + "\n").encode())
+    s.sendall((json.dumps({"id": 1, "auth": token, "method": method, "params": params}) + "\n").encode())
     buf = b""
     while not buf.endswith(b"\n"):
         c = s.recv(1 << 20)

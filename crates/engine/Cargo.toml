@@ -23,6 +23,7 @@ lightcraft-codecs = { workspace = true }
 lightcraft-raw = { workspace = true }
 lightcraft-meta = { workspace = true }
 miniz_oxide = { workspace = true }
+crc32fast = { workspace = true }
 lightcraft-merge = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }

@@ -281,6 +281,14 @@ fn windows_open_url_command(url: &str) -> std::process::Command {
     c
 }
 
+/// Open a photo with its registered Windows application without passing its filename through
+/// `cmd.exe`: an imported filename may contain shell metacharacters such as `&`.
+fn windows_open_file_command(path: &str) -> std::process::Command {
+    let mut c = std::process::Command::new("rundll32");
+    c.args(["url.dll,FileProtocolHandler", path]);
+    c
+}
+
 /// The platform services; `ctx` repaints when a file dialog closes, and `log_file` is
 /// for Help ▸ Open Log Folder.
 fn services(ctx: egui::Context, log_file: Option<&std::path::Path>) -> Services {
@@ -339,17 +347,14 @@ fn services(ctx: egui::Context, log_file: Option<&std::path::Path>) -> Services 
                 }
                 c
             } else if app.is_empty() {
-                if cfg!(target_os = "windows") {
-                    let mut c = std::process::Command::new("cmd");
-                    c.args(["/C", "start", ""]);
-                    c
-                } else {
-                    std::process::Command::new("xdg-open")
-                }
+                if cfg!(target_os = "windows") { windows_open_file_command(path) } else { std::process::Command::new("xdg-open") }
             } else {
                 std::process::Command::new(app)
             };
-            c.arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
+            if !app.is_empty() || !cfg!(target_os = "windows") {
+                c.arg(path);
+            }
+            c.spawn().map(|_| ()).map_err(|e| e.to_string())
         })),
         open_url: Some(Box::new(|url: &str| {
             if !url.starts_with("https://") {
@@ -491,10 +496,12 @@ OPTIONS:
   --no-demo        don't seed a new library with the procedural demo photos
   --memory         throwaway in-memory session (alias --demo); nothing is saved
   --control PORT   serve the JSON-lines control channel on 127.0.0.1:PORT (env LIGHTCRAFT_CONTROL_PORT;
-                   see docs/control-protocol.md)
+                   requires LIGHTCRAFT_CONTROL_TOKEN; see docs/control-protocol.md)
   --version, --help
 
 ENVIRONMENT:
+  LIGHTCRAFT_CONTROL_TOKEN=SECRET   required for --control; 32–256 printable ASCII characters,
+                   sent by CLI clients in each request's auth field
   LIGHTCRAFT_GPU_BACKEND=dx12|vulkan|metal|auto|off   graphics backend (default: DX12 on Windows, Metal on macOS,
                    Vulkan on Linux; off = render on the CPU); else WGPU_BACKEND. LIGHTCRAFT_GPU=0: CPU rendering.
   LIGHTCRAFT_SAM3_DIR=DIR   the SAM 3 model for Object / Describe masks (default: <settings folder>/models/sam3;
@@ -885,6 +892,15 @@ mod tests {
         assert_eq!(c.get_program(), "rundll32");
         let args: Vec<&std::ffi::OsStr> = c.get_args().collect();
         assert_eq!(args, ["url.dll,FileProtocolHandler", url]);
+    }
+
+    #[test]
+    fn windows_photo_names_are_never_passed_through_cmd() {
+        let path = r"C:\Photos\holiday & calc.jpg";
+        let c = windows_open_file_command(path);
+        assert_eq!(c.get_program(), "rundll32");
+        let args: Vec<&std::ffi::OsStr> = c.get_args().collect();
+        assert_eq!(args, ["url.dll,FileProtocolHandler", path]);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! resources and forwards everything to a [`Backend`]:
 //!
 //! - [`Remote`] talks to a running desktop app through its loopback JSON-lines control channel
-//!   (`lightcraft --control 7980`): one `{"id","method","params"}` line in, one
+//!   (`lightcraft --control 7980`): one `{"id","auth","method","params"}` line in, one
 //!   `{"id","ok","result"|"error"}` line out (see `docs/control-protocol.md`).
 //! - [`Headless`] hosts an in-process [`lightcraft_engine::Session`] and answers the same
 //!   control-channel method names itself (rendering with the engine's pipeline and encoding with

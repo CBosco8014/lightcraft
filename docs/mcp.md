@@ -28,6 +28,9 @@ Logs go to stderr; stdout carries only protocol messages.
 ## Wiring it into a client
 
 Build once: `cargo build --release -p lightcraft-cli` (binary: `target/release/lightcraft-cli`).
+For connect mode, set the same `LIGHTCRAFT_CONTROL_TOKEN` in the desktop app's and MCP client's
+environments (generate one with `openssl rand -hex 32`). The app refuses to open the control port
+without it; see [control-protocol.md](control-protocol.md).
 
 ### Claude Code
 

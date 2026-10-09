@@ -3,6 +3,7 @@
 The screenshots in `docs/images/` are captured by driving LightCraft over its control channel.
 
 ```sh
+export LIGHTCRAFT_CONTROL_TOKEN="$(openssl rand -hex 32)"
 # public-domain set (downloaded into the gitignored corpus/, see assets/ATTRIBUTION.md for sources)
 cargo run --release -p lightcraft -- --memory --control 7980 corpus/images/pd &
 python3 docs/showcase/run.py docs/showcase/pd-edits.jsonl

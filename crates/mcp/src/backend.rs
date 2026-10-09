@@ -82,7 +82,8 @@ impl Backend for Remote {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let line = json!({"id": id, "method": method, "params": params}).to_string();
+        let token = std::env::var("LIGHTCRAFT_CONTROL_TOKEN").ok();
+        let line = json!({"id": id, "auth": token, "method": method, "params": params}).to_string();
         // One retry with a fresh connection (the app may have restarted).
         let reply = match self.roundtrip(&line) {
             Ok(r) => r,
